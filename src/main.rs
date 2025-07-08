@@ -27,7 +27,7 @@ use sea_orm::{DbErr, PaginatorTrait};
 use sea_orm::{FromQueryResult, IntoActiveModel};
 use std::cmp::min;
 // use std::fs::File;
-use tokenizer::Meta;
+// use tokenizer::Meta;
 
 use std::env;
 
@@ -104,7 +104,7 @@ struct ConvertToJSONRequestBody {
 }
 
 #[get("/")]
-async fn version() -> impl Responder {
+async fn get_version() -> impl Responder {
     HttpResponse::Ok().body("0.13.0")
 }
 
@@ -483,6 +483,96 @@ async fn api_create(
         "rules_id": rules_id
     }))
 }
+#[derive(Debug, MultipartForm)]
+struct UploadFormApiCreateFile {
+    category: Text<String>,
+    name: Text<String>,
+    version: Text<i32>,
+    description: Text<String>,
+    #[multipart(limit = "100MB")]
+    file: TempFile,
+}
+
+#[post("/api/create/file")]
+async fn api_create_file(
+    db: web::Data<DatabaseConnection>,
+    MultipartForm(mut form): MultipartForm<UploadFormApiCreateFile>,
+) -> impl Responder {
+    // let api_create_json = req_body.into_inner();
+    let mut buffer = vec![];
+    // let response_str;
+    let _ = form.file.file.read_to_end(&mut buffer);
+    let s = String::from_utf8(buffer);
+    let yara_file: tokenizer::YaraFile;
+    match s {
+        Ok(str) => match tokenizer::YaraFile::from_str(&str) {
+            Ok(f) => yara_file = f,
+            Err(e) => return HttpResponse::Ok().json(json!({"message": e.to_string()})),
+        },
+        Err(e) => return HttpResponse::Ok().json(json!({"message": e.to_string()})),
+    }
+
+    let name: String = form.name.into_inner();
+    let version_: i32 = form.version.into_inner();
+    let description: String = form.description.into_inner();
+    let category: String = form.category.into_inner();
+
+    // Try to compile the YARA file
+    let text_yara = yara_file.to_string();
+    let mut compiler = yara_x::Compiler::new();
+    if let Err(e) = compiler.add_source(text_yara.as_str()) {
+        return HttpResponse::InternalServerError()
+            .json(json!({"message": format!("Failed to add YARA source: {}", e)}));
+    }
+
+    let rules = compiler.build();
+
+    let compiled_yara = match rules.serialize() {
+        Ok(data) => data,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({"message": format!("Failed to serialize YARA rules: {}", e)}))
+        }
+    };
+
+    let imports = yara_file.modules.clone();
+
+    let new_yara_file = yara_file::ActiveModel {
+        name: Set(name),
+        last_modified_time: Set(chrono::Utc::now().into()),
+        version: Set(Some(version_)),
+        compiled_data: Set(Some(compiled_yara)),
+        description: Set(Some(description)),
+        created_at: NotSet,
+        updated_at: NotSet,
+        category: Set(Some(category)),
+        imports: Set(Some(imports)),
+        ..Default::default()
+    };
+
+    let res = YaraFile::insert(new_yara_file).exec(db.get_ref()).await;
+    let yara_file_id = match res {
+        Ok(inserted) => inserted.last_insert_id,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({"message": format!("Database insertion failed: {}", e)}))
+        }
+    };
+
+    let rules_id = match create_or_update_rules_via_id(&db, yara_file.rules, yara_file_id).await {
+        Ok(id) => id,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({"message": format!("Failed to update rules: {}", e)}))
+        }
+    };
+
+    HttpResponse::Ok().json(json!({
+        "yara_file_id": yara_file_id,
+        "rules_id": rules_id
+    }))
+}
+
 #[post("/api/add")]
 async fn api_add(
     db: web::Data<DatabaseConnection>,
@@ -611,34 +701,29 @@ pub async fn create_or_update_rules_via_id(
                 verification: Set(item.get_meta_bool("verification")),
                 source: Set(Some(
                     sea_orm_active_enums::Source::try_from(
-                        item.get_meta_string("source")
-                            .unwrap_or_else(|| "".to_string())
-                            .as_str(),
+                        item.get_meta_string("source").unwrap_or_default().as_str(),
                     )
-                    .unwrap(),
+                    .unwrap_or(sea_orm_active_enums::Source::Official),
                 )),
                 version: Set(Some(1)),
                 sharing: Set(Some(
                     sea_orm_active_enums::Sharing::try_from(
-                        item.get_meta_string("sharing")
-                            .unwrap_or_else(|| "".to_string())
-                            .as_str(),
+                        item.get_meta_string("sharing").unwrap_or_default().as_str(),
                     )
-                    .unwrap(),
+                    .unwrap_or(sea_orm_active_enums::Sharing::TlpRed),
                 )),
                 grayscale: Set(item.get_meta_bool("grayscale")),
                 attribute: Set(Some(
                     sea_orm_active_enums::Attribute::try_from(
                         item.get_meta_string("attribute")
-                            .unwrap_or_else(|| "".to_string())
+                            .unwrap_or_default()
                             .as_str(),
                     )
-                    .unwrap(),
+                    .unwrap_or(sea_orm_active_enums::Attribute::White),
                 )),
                 created_at: sea_orm::ActiveValue::NotSet,
                 updated_at: sea_orm::ActiveValue::NotSet,
             };
-
             let insert_result = yara_rules::Entity::insert(new_rule).exec(db).await?;
             rules_ids.push(insert_result.last_insert_id.into());
         }
@@ -651,7 +736,7 @@ async fn build_tokenizer_yara_file_from_db(
     yara_file_id: i32,
     mut base_yara_file: tokenizer::YaraFile,
 ) -> Result<tokenizer::YaraFile, HttpResponse> {
-    // 先根据 id 查找 YaraFile
+    // 根据 id 查找 YaraFile
     let existing = match YaraFile::find_by_id(yara_file_id).one(db).await {
         Ok(Some(file)) => file,
         Ok(None) => {
@@ -662,7 +747,7 @@ async fn build_tokenizer_yara_file_from_db(
         }
     };
 
-    // 根据找到的 YaraFile 查找所有关联的规则
+    // 查找所有关联的规则
     let rules = match existing.find_related(yara_rules::Entity).all(db).await {
         Ok(rules) => rules,
         Err(e) => {
@@ -673,102 +758,113 @@ async fn build_tokenizer_yara_file_from_db(
 
     // 遍历每个 rule 并转换后 merge 到 base_yara_file 中
     for rule in rules {
-        // let active_rule: yara_rules::ActiveModel = rule.clone().into();
+        // 优雅地解析 rule.strings；若解析出错则输出错误日志并返回空 Vec
+        let strings = match &rule.strings {
+            Some(s) => tokenizer::parse_strings_vec(s.clone()).unwrap_or_else(|e| {
+                eprintln!("Error parsing strings for rule {}: {:?}", rule.name, e);
+                vec![]
+            }),
+            None => vec![],
+        };
+
         let tmp_yara_file = tokenizer::YaraFile {
             modules: vec![],
             rules: vec![tokenizer::YaraRule {
-                name: rule.name,
+                name: rule.name.clone(),
                 private: rule.private.unwrap_or(false),
                 global: rule.global.unwrap_or(false),
-                tags: rule.tag.unwrap_or(vec![]),
+                tags: rule.tag.unwrap_or_default(),
                 meta: vec![
-                    Meta {
+                    tokenizer::Meta {
                         key: "id".to_string(),
                         value: tokenizer::MetaValue::Number(rule.id.into()),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "auth".to_string(),
-                        value: tokenizer::MetaValue::String(rule.auth.unwrap_or("".to_string())),
+                        value: tokenizer::MetaValue::String(rule.auth.unwrap_or_default()),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "description".to_string(),
-                        value: tokenizer::MetaValue::String(
-                            rule.description.unwrap_or("".to_string()),
-                        ),
+                        value: tokenizer::MetaValue::String(rule.description.unwrap_or_default()),
                     },
-                    // Meta {
-                    //     key: "description".to_string(),
-                    //     value: tokenizer::MetaValue::String(
-                    //         rule.description.unwrap_or("".to_string()),
-                    //     ),
-                    // },
-                    Meta {
+                    tokenizer::Meta {
                         key: "last_modified_time".to_string(),
-                        value: tokenizer::MetaValue::String(
-                            Some(rule.last_modified_time)
-                                .map_or(String::new(), |dt| dt.to_string()),
-                        ),
+                        // 如果字段不是 Option，则直接转换为字符串
+                        value: tokenizer::MetaValue::String(rule.last_modified_time.to_string()),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "loading_time".to_string(),
+                        // 如果 loading_time 为 Option，则转换
                         value: tokenizer::MetaValue::String(
-                            rule.loading_time.map_or(String::new(), |dt| dt.to_string()),
+                            rule.loading_time
+                                .map(|dt| dt.to_string())
+                                .unwrap_or_default(),
                         ),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "belonging".to_string(),
                         value: tokenizer::MetaValue::Number(rule.belonging.into()),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "verification".to_string(),
                         value: tokenizer::MetaValue::Boolean(rule.verification.unwrap_or(false)),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "source".to_string(),
                         value: tokenizer::MetaValue::String(
-                            rule.source.unwrap().as_ref().to_string(),
+                            // 如果 rule.source 为 Some，则转换为字符串；否则返回 ""
+                            rule.source
+                                .map(|s| s.as_ref().to_string())
+                                .unwrap_or_else(|| "".to_string()),
                         ),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "version".to_string(),
-                        value: tokenizer::MetaValue::Number(rule.version.unwrap().into()),
+                        value: tokenizer::MetaValue::Number(
+                            rule.version.unwrap_or_default().into(),
+                        ),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "sharing".to_string(),
                         value: tokenizer::MetaValue::String(
-                            rule.sharing.unwrap().as_ref().to_string(),
+                            rule.sharing
+                                .map(|s| s.as_ref().to_string())
+                                .unwrap_or_else(|| "".to_string()),
                         ),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "grayscale".to_string(),
-                        value: tokenizer::MetaValue::Boolean(rule.grayscale.unwrap()),
+                        value: tokenizer::MetaValue::Boolean(rule.grayscale.unwrap_or(false)),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "attribute".to_string(),
                         value: tokenizer::MetaValue::String(
-                            rule.attribute.unwrap().as_ref().to_string(),
+                            rule.attribute
+                                .map(|a| a.as_ref().to_string())
+                                .unwrap_or_else(|| "".to_string()),
                         ),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "created_at".to_string(),
                         value: tokenizer::MetaValue::String(
-                            rule.created_at.map_or(String::new(), |dt| dt.to_string()),
+                            rule.created_at.map(|dt| dt.to_string()).unwrap_or_default(),
                         ),
                     },
-                    Meta {
+                    tokenizer::Meta {
                         key: "updated_at".to_string(),
                         value: tokenizer::MetaValue::String(
-                            rule.updated_at.map_or(String::new(), |dt| dt.to_string()),
+                            rule.updated_at.map(|dt| dt.to_string()).unwrap_or_default(),
                         ),
                     },
                 ],
-                strings: tokenizer::parse_strings_vec(rule.strings.unwrap()).unwrap(),
-                condition: rule.condition.unwrap_or("".to_string()),
+                strings,
+                condition: rule.condition.unwrap_or_default(),
             }],
         };
+
         base_yara_file.merge(tmp_yara_file);
     }
-    base_yara_file.modules = existing.imports.unwrap_or(vec![]);
+    base_yara_file.modules = existing.imports.unwrap_or_default();
     Ok(base_yara_file)
 }
 
@@ -1068,38 +1164,166 @@ async fn api_rule_one(
     }
 }
 
+/// 用于分页查询的参数
+#[derive(Debug, serde::Deserialize)]
+struct PaginationParamsApiRulePage {
+    page: Option<u32>,
+    per_page: Option<u32>,
+    file_info: Option<bool>,
+}
+
+// 定义返回给前端的 file 信息结构，排除掉 compiled_data 字段
+#[derive(Serialize)]
+struct YaraFileWithoutCompiledData {
+    id: i32,
+    name: String,
+    last_modified_time: DateTime<Utc>,
+    version: Option<i32>,
+    description: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    category: Option<String>,
+    imports: Option<Vec<String>>,
+}
+
+// 当 include_file 为 true 时，返回的新结构体，包含 rule 信息及其所属的 file 信息
+#[derive(Serialize)]
+struct RuleWithFile {
+    // 以下字段为 yara rule 的关键信息，可根据需要增加其他字段
+    id: i32,
+    name: String,
+    private: Option<bool>,
+    global: Option<bool>,
+    auth: Option<String>,
+    description: Option<String>,
+    tag: Option<Vec<String>>,
+    strings: Option<Vec<String>>,
+    condition: Option<String>,
+    last_modified_time: DateTime<Utc>,
+    loading_time: Option<DateTime<Utc>>,
+    belonging: i32,
+    verification: Option<bool>,
+    // 注意：Source, Sharing, Attribute 等自定义枚举类型需要实现 Serialize
+    source: Option<sea_orm_active_enums::Source>,
+    version: Option<i32>,
+    sharing: Option<sea_orm_active_enums::Sharing>,
+    grayscale: Option<bool>,
+    attribute: Option<sea_orm_active_enums::Attribute>,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+
+    // 附加字段，所属的 yara file 信息（排除 compiled_data）
+    file: Option<YaraFileWithoutCompiledData>,
+}
+
 /// GET /api/rule/page?page={page}&per_page={per_page}
 /// 分页获得 rule 信息
 #[get("/api/rule/page")]
 async fn api_rule_page(
     db: web::Data<sea_orm::DatabaseConnection>,
-    web::Query(pagination): web::Query<PaginationParams>,
+    web::Query(pagination): web::Query<PaginationParamsApiRulePage>,
 ) -> impl Responder {
     // 默认页码为 1，每页 10 条记录
     let page: u32 = pagination.page.unwrap_or(1);
     let per_page: u32 = pagination.per_page.unwrap_or(10);
     let offset = (page - 1) * per_page;
 
-    // 获取分页数据
-    let rules_result = yara_rules::Entity::find()
-        .order_by_asc(yara_rules::Column::Id)
-        .limit(per_page as u64)
-        .offset(offset as u64)
-        .all(db.get_ref())
-        .await;
-    // 同时查询出总记录数
+    // 先查询总记录数
     let count_result = yara_rules::Entity::find().count(db.get_ref()).await;
 
-    match (rules_result, count_result) {
-        (Ok(rules), Ok(total)) => HttpResponse::Ok().json(json!({
-            "page": page,
-            "per_page": per_page,
-            "total": total,
-            "items": rules
-        })),
-        (Err(e), _) | (_, Err(e)) => {
-            eprintln!("Error during paginated rules query: {:?}", e);
-            HttpResponse::InternalServerError().json(json!({"message": e.to_string()}))
+    // 判断是否需要附带 yara file 信息
+    if pagination.file_info.unwrap_or(false) {
+        // 使用 eager loading 的方式，同时查询每个 rule 关联的 yara file 信息
+        // 因为 yara rule 与 yara file 之间是一对一或多对一关系，这里使用 find_also_related
+        let query_result = yara_rules::Entity::find()
+            .order_by_asc(yara_rules::Column::Id)
+            .limit(per_page as u64)
+            .offset(offset as u64)
+            .find_also_related(yara_file::Entity)
+            .all(db.get_ref())
+            .await;
+
+        match (query_result, count_result) {
+            (Ok(results), Ok(total)) => {
+                // results 的类型为 Vec<(yara_rules::Model, Option<yara_file::Model>)>
+                let items: Vec<RuleWithFile> = results
+                    .into_iter()
+                    .map(|(rule, file_opt)| {
+                        // 转换 yara rule 的时间字段从 FixedOffset 到 Utc（假设类型兼容）
+                        // 若你的字段类型为 DateTimeWithTimeZone, 使用 .into() 或 .with_timezone(&Utc)
+                        let converted_last_modified = rule.last_modified_time.into();
+                        let converted_loading_time = rule.loading_time.map(|dt| dt.into());
+                        let converted_created_at = rule.created_at.map(|dt| dt.into());
+                        let converted_updated_at = rule.updated_at.map(|dt| dt.into());
+
+                        // 对关联的 file 同理也进行转换
+                        let file = file_opt.map(|f| YaraFileWithoutCompiledData {
+                            id: f.id,
+                            name: f.name,
+                            last_modified_time: f.last_modified_time.into(),
+                            version: f.version,
+                            description: f.description,
+                            created_at: f.created_at.map(|dt| dt.into()),
+                            updated_at: f.updated_at.map(|dt| dt.into()),
+                            category: f.category,
+                            imports: f.imports,
+                        });
+                        RuleWithFile {
+                            id: rule.id,
+                            name: rule.name,
+                            private: rule.private,
+                            global: rule.global,
+                            auth: rule.auth,
+                            description: rule.description,
+                            tag: rule.tag,
+                            strings: rule.strings,
+                            condition: rule.condition,
+                            last_modified_time: converted_last_modified,
+                            loading_time: converted_loading_time,
+                            belonging: rule.belonging,
+                            verification: rule.verification,
+                            source: rule.source,
+                            version: rule.version,
+                            sharing: rule.sharing,
+                            grayscale: rule.grayscale,
+                            attribute: rule.attribute,
+                            created_at: converted_created_at,
+                            updated_at: converted_updated_at,
+                            file,
+                        }
+                    })
+                    .collect();
+                HttpResponse::Ok().json(json!({
+                    "page": page,
+                    "per_page": per_page,
+                    "total": total,
+                    "items": items
+                }))
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("Error during paginated rules query: {:?}", e);
+                HttpResponse::InternalServerError().json(json!({"message": e.to_string()}))
+            }
+        }
+    } else {
+        // 仅返回 yara rule 信息，不进行额外关联查询
+        let rules_result = yara_rules::Entity::find()
+            .order_by_asc(yara_rules::Column::Id)
+            .limit(per_page as u64)
+            .offset(offset as u64)
+            .all(db.get_ref())
+            .await;
+        match (rules_result, count_result) {
+            (Ok(rules), Ok(total)) => HttpResponse::Ok().json(json!({
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "items": rules
+            })),
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("Error during paginated rules query: {:?}", e);
+                HttpResponse::InternalServerError().json(json!({"message": e.to_string()}))
+            }
         }
     }
 }
@@ -1129,6 +1353,18 @@ async fn api_rule_history(
 }
 
 /// ------------------- APIs for Yara Files ------------------------------
+#[derive(FromQueryResult, Debug, Serialize)]
+pub struct YaraFileGet {
+    pub id: i32,
+    pub name: String,
+    pub last_modified_time: DateTime<Utc>,
+    pub version: Option<i32>,
+    pub description: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub category: Option<String>,
+    pub imports: Option<Vec<String>>,
+}
 
 /// GET /api/yara_file/get?id={id}
 /// 根据 query 参数获得单个 yara file 信息
@@ -1138,10 +1374,20 @@ async fn api_yara_file_get(
     web::Query(info): web::Query<IdParam>,
 ) -> impl Responder {
     let file_id = info.id;
-    match yara_file::Entity::find_by_id(file_id)
-        .one(db.get_ref())
-        .await
-    {
+    let query = yara_file::Entity::find_by_id(file_id)
+        .select_only()
+        .column(yara_file::Column::Id)
+        .column(yara_file::Column::Name)
+        .column(yara_file::Column::LastModifiedTime)
+        .column(yara_file::Column::Version)
+        .column(yara_file::Column::Description)
+        .column(yara_file::Column::CreatedAt)
+        .column(yara_file::Column::UpdatedAt)
+        .column(yara_file::Column::Category)
+        .column(yara_file::Column::Imports)
+        .into_model::<YaraFileGet>();
+
+    match query.one(db.get_ref()).await {
         Ok(Some(file)) => HttpResponse::Ok().json(file),
         Ok(None) => HttpResponse::NotFound().json(json!({"message": "Yara file not found"})),
         Err(e) => {
@@ -1151,8 +1397,29 @@ async fn api_yara_file_get(
     }
 }
 
-/// GET /api/yara_file/page?page={page}&per_page={per_page}
-/// 分页获得 yara file 信息
+use chrono::DateTime;
+
+#[derive(Serialize)]
+struct YaraFileWithRules {
+    id: i32,
+    name: String,
+    last_modified_time: DateTime<Utc>,
+    version: Option<i32>,
+    description: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    category: Option<String>,
+    imports: Option<Vec<String>>,
+
+    rules: Vec<YaraRuleSummary>,
+}
+
+#[derive(Serialize)]
+struct YaraRuleSummary {
+    id: i32,
+    name: String,
+}
+
 #[get("/api/yara_file/page")]
 async fn api_yara_file_page(
     db: web::Data<sea_orm::DatabaseConnection>,
@@ -1162,26 +1429,61 @@ async fn api_yara_file_page(
     let per_page: u32 = pagination.per_page.unwrap_or(10);
     let offset = (page - 1) * per_page;
 
-    // 获取分页数据
-    let files_result = yara_file::Entity::find()
+    let base_query = yara_file::Entity::find();
+
+    let count_result = base_query
+        .clone()
+        .group_by(yara_file::Column::Id)
+        .count(db.get_ref())
+        .await;
+
+    let file_with_rules_result = base_query
         .order_by_asc(yara_file::Column::Id)
         .limit(per_page as u64)
         .offset(offset as u64)
+        .find_with_related(yara_rules::Entity)
         .all(db.get_ref())
         .await;
-    // 查询总数
-    let count_result = yara_file::Entity::find().count(db.get_ref()).await;
 
-    match (files_result, count_result) {
-        (Ok(files), Ok(total)) => HttpResponse::Ok().json(json!({
-            "page": page,
-            "per_page": per_page,
-            "total": total,
-            "items": files
-        })),
+    match (file_with_rules_result, count_result) {
+        (Ok(files_with_rules), Ok(total)) => {
+            // files_with_rules 的类型为 Vec<(yara_file::Model, Vec<yara_rules::Model>)>
+            let items: Vec<YaraFileWithRules> = files_with_rules
+                .into_iter()
+                .map(|(file, rules)| {
+                    let rule_summaries: Vec<YaraRuleSummary> = rules
+                        .into_iter()
+                        .map(|rule| YaraRuleSummary {
+                            id: rule.id,
+                            name: rule.name,
+                        })
+                        .collect();
+
+                    YaraFileWithRules {
+                        id: file.id,
+                        name: file.name,
+                        last_modified_time: file.last_modified_time.into(),
+                        version: file.version,
+                        description: file.description,
+                        created_at: file.created_at.map(|dt| dt.into()),
+                        updated_at: file.updated_at.map(|dt| dt.into()),
+                        category: file.category,
+                        imports: file.imports,
+                        rules: rule_summaries,
+                    }
+                })
+                .collect();
+
+            HttpResponse::Ok().json(json!({
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "items": items,
+            }))
+        }
         (Err(e), _) | (_, Err(e)) => {
             eprintln!("Error during paginated yara file query: {:?}", e);
-            HttpResponse::InternalServerError().json(json!({"message": e.to_string()}))
+            HttpResponse::InternalServerError().json(json!({ "message": e.to_string() }))
         }
     }
 }
@@ -1688,7 +1990,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(pool.clone())
             .service(json_convert_to_text)
             .service(convert_to_json)
-            .service(version)
+            .service(get_version)
             .service(file_convert_to_json)
             .service(get_all_rules)
             .service(get_rule_by_id)
@@ -1701,6 +2003,7 @@ async fn main() -> std::io::Result<()> {
             .service(update_yara_file)
             .service(delete_yara_file)
             .service(api_create)
+            .service(api_create_file)
             .service(api_add)
             .service(api_update)
             .service(api_rule_delete)
@@ -1721,7 +2024,7 @@ async fn main() -> std::io::Result<()> {
 
 // 附件解析逻辑
 use base64::{prelude::BASE64_STANDARD, Engine};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::str;
 
 #[derive(Debug, Deserialize)]
